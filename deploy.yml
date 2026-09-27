@@ -1,0 +1,106 @@
+name: Test and deploy API
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: api-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run lint
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_PATH: ${{ secrets.VPS_PATH }}
+      VPS_PORT: ${{ secrets.VPS_PORT }}
+    steps:
+      - name: Configure SSH
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$VPS_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || fail 'Set VPS_HOST to the VPS hostname or IPv4 address.'
+          [[ "$VPS_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || fail 'Set VPS_USER to your Linux username.'
+          [[ "$VPS_PATH" == "/home/$VPS_USER/product-api-deployment" ]] || fail 'VPS_PATH must be /home/<VPS_USER>/product-api-deployment.'
+          [[ "$VPS_PORT" =~ ^[1-9][0-9]{3,4}$ ]] || fail 'Set VPS_PORT to your assigned API port, not SSH port 22.'
+          (( VPS_PORT >= 1024 && VPS_PORT <= 65535 )) || fail 'VPS_PORT must be between 1024 and 65535.'
+          [[ -n "$VPS_SSH_KEY" && -n "$VPS_KNOWN_HOSTS" ]] || fail 'Set VPS_SSH_KEY and mentor-verified VPS_KNOWN_HOSTS.'
+          install -m 700 -d ~/.ssh
+          umask 077
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/vps_key
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          ssh-keygen -y -f ~/.ssh/vps_key > /dev/null
+
+      - name: Deploy over SSH
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/vps_key -o BatchMode=yes -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes -o ConnectTimeout=15 \
+            "$VPS_USER@$VPS_HOST" bash -se -- "$VPS_PATH" "$VPS_PORT" "$GITHUB_SHA" <<'REMOTE'
+          set -euo pipefail
+          project_path=$1
+          api_port=$2
+          tested_commit=$3
+          cd "$project_path"
+          [[ -f .env ]] || { echo 'Copy your classroom .env before deploying.'; exit 1; }
+          [[ "$(git branch --show-current)" == main ]] || { echo 'The VPS checkout must use branch main.'; exit 1; }
+          exec 9>"$(git rev-parse --git-path deploy.lock)"
+          flock -w 120 9
+          git diff --quiet && git diff --cached --quiet || { echo 'Commit or resolve local tracked changes on the VPS first.'; exit 1; }
+          git fetch origin main
+          if [[ "$(git rev-parse origin/main)" != "$tested_commit" ]]; then
+            echo 'A newer main commit exists; skip this older deployment.'
+            exit 0
+          fi
+          git merge --ff-only "$tested_commit"
+          [[ "$(git rev-parse HEAD)" == "$tested_commit" ]] || { echo 'VPS checkout differs from the tested commit.'; exit 1; }
+          if [[ "$(docker context show)" == rootless ]]; then
+            [[ -f docker-compose.override.yml ]] || { echo 'Copy the classroom Docker resource override before deploying.'; exit 1; }
+            systemctl --user start docker
+            docker info --format '{{json .SecurityOptions}}' | grep -q rootless
+          fi
+          docker compose config --quiet
+          docker compose up --build -d
+          docker compose port api 3000 | grep -Eq ":${api_port}$" || { echo 'VPS_PORT must match HOST_PORT in your VPS .env.'; exit 1; }
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --max-time 5 "http://127.0.0.1:$api_port/health" > /dev/null \
+              && curl --fail --silent --max-time 5 "http://127.0.0.1:$api_port/api/products" > /dev/null; then
+              echo 'Deployment verified: API and database respond successfully.'
+              exit 0
+            fi
+            sleep 2
+          done
+          echo 'API/database readiness failed. Inspect docker compose ps and logs on the VPS.'
+          exit 1
+          REMOTE
+
+      - name: Remove SSH private key
+        if: always()
+        run: rm -f ~/.ssh/vps_key
